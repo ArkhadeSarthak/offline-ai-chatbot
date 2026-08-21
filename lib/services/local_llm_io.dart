@@ -3,8 +3,11 @@ import 'dart:ffi';
 import 'dart:io';
 import 'package:flutter/foundation.dart';
 import 'package:llama_cpp_dart/llama_cpp_dart.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 import 'local_llm_helper.dart';
 import 'gguf_validator.dart';
+import 'device_info_helper.dart';
+import 'settings_service.dart';
 
 LocalLLM getPlatformLLM() => LocalLLMIO();
 
@@ -34,7 +37,29 @@ class LocalLLMIO implements LocalLLM {
   LlamaParent? _llamaParent;
   String? _modelPath;
   bool _librariesPreloaded = false;
+  bool _isGenerating = false;
+  StreamSubscription<String>? _activeSubscription;
   final AsyncLock _lock = AsyncLock();
+
+  // Diagnostic metrics
+  int lastInferenceDurationMs = 0;
+  int lastTokenCount = 0;
+  String lastFirstTokenTime = '0ms';
+  String? lastError;
+  String lastCrashMarker = 'IDLE';
+  int activeContextSize = 2048;
+  int activeThreadCount = 2;
+
+  static const String _crashMarkerKey = 'last_native_crash_marker';
+
+  Future<void> _setCrashMarker(String marker) async {
+    lastCrashMarker = marker;
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.setString(_crashMarkerKey, marker);
+      debugPrint("[LLM_CRASH_MARKER] $marker");
+    } catch (_) {}
+  }
 
   void _preloadLibraries() {
     if (_librariesPreloaded) return;
@@ -46,11 +71,12 @@ class LocalLLMIO implements LocalLLM {
         'libggml.so',
         'libggml-cpu.so',
         'libllama.so',
+        'libmtmd.so',
       ];
       for (final lib in libs) {
         try {
           DynamicLibrary.open(lib);
-          debugPrint('[LocalMind] Successfully preloaded library: $lib');
+          debugPrint('[LocalMind] Preloaded library: $lib');
         } catch (e) {
           debugPrint('[LocalMind] Preload note for $lib: $e');
         }
@@ -59,10 +85,12 @@ class LocalLLMIO implements LocalLLM {
     _librariesPreloaded = true;
   }
 
-  int _calculateOptimalThreads() {
+  int _calculateOptimalThreads(int requestedThreads) {
+    if (requestedThreads > 0) {
+      return requestedThreads.clamp(1, 8);
+    }
     try {
       final cores = Platform.numberOfProcessors;
-      // Reserve at least 1 core for OS/UI, min 1, max 4 threads for mobile safety
       final threads = (cores > 2) ? (cores - 1) : 1;
       return threads.clamp(1, 4);
     } catch (_) {
@@ -70,72 +98,112 @@ class LocalLLMIO implements LocalLLM {
     }
   }
 
-  int _calculateOptimalContextSize(int fileSize) {
-    // If file is > 2GB (approx 2147483648 bytes), scale nCtx down to 1024 to save native RAM on Android
-    if (fileSize > 2000 * 1024 * 1024) {
+  int _calculateOptimalContextSize(int fileSize, int requestedCtx) {
+    if (requestedCtx > 0) {
+      return requestedCtx;
+    }
+    // Scale nCtx down to 1024 for files > 1.8GB to protect mobile RAM
+    if (fileSize > 1800 * 1024 * 1024) {
       return 1024;
     }
     return 2048;
   }
 
   @override
-  Future<void> loadModel(String modelPath) async {
+  Future<void> loadModel(String modelPath, {InferenceSettings? settings}) async {
     return _lock.run(() async {
-      await _loadModelInternal(modelPath);
+      await _loadModelInternal(modelPath, settings: settings);
     });
   }
 
-  Future<void> _loadModelInternal(String modelPath) async {
+  Future<void> _loadModelInternal(String modelPath, {InferenceSettings? settings}) async {
     if (_modelPath == modelPath && _llamaParent != null) {
-      debugPrint("[LocalMind] Model already loaded at: $modelPath");
+      debugPrint("[LLM] ACTIVE_MODEL=$modelPath");
+      debugPrint("[LLM] MODEL_LOADED=true (Cached)");
       return;
     }
+
+    await _setCrashMarker("STAGE_MODEL_LOAD_START: $modelPath");
 
     if (_llamaParent != null) {
       await _unloadModelInternal();
     }
 
+    final modelName = modelPath.split('/').last.split('\\').last;
+    debugPrint("[LLM] ACTIVE_MODEL=$modelName");
     final startTime = DateTime.now();
-    debugPrint("[LocalMind] Step 1/4: Validating GGUF model binary at path: $modelPath");
 
     // 1. Verify GGUF header & file integrity
+    await _setCrashMarker("STAGE_GGUF_HEADER_VALIDATE");
     final validation = await GgufValidator.validateFile(modelPath);
     if (!validation.isValid) {
-      debugPrint("[LocalMind] [CRITICAL ERROR] Invalid GGUF model: ${validation.error}");
+      lastError = "Invalid GGUF model: ${validation.error}";
+      await _setCrashMarker("STAGE_GGUF_HEADER_ERROR: ${validation.error}");
+      debugPrint("[LLM] [CRITICAL ERROR] Invalid GGUF model: ${validation.error}");
       throw Exception("Invalid GGUF model binary: ${validation.error}");
     }
 
-    debugPrint("[LocalMind] Step 2/4: GGUF Header valid. Version: ${validation.version}, Tensors: ${validation.tensorCount}, Size: ${(validation.fileSize / (1024*1024)).toStringAsFixed(1)} MB");
-
-    // 2. Preload Libraries safely
-    _preloadLibraries();
-
-    // 3. Compute dynamic thread count and context size
-    final nThreads = _calculateOptimalThreads();
-    final nCtx = _calculateOptimalContextSize(validation.fileSize);
-
-    debugPrint("[LocalMind] Step 3/4: Configuring llama.cpp backend - nThreads=$nThreads, nCtx=$nCtx, nGpuLayers=0 (CPU backend)");
+    // 2. RAM Pre-check Safeguard for Mobile
+    await _setCrashMarker("STAGE_RAM_PRECHECK");
+    final infSettings = settings ?? InferenceSettings();
+    activeThreadCount = _calculateOptimalThreads(infSettings.cpuThreads);
+    activeContextSize = _calculateOptimalContextSize(validation.fileSize, infSettings.contextLength);
 
     try {
+      final specs = await DeviceInfoHelper.getDeviceSpecs();
+      final availableRamBytes = (specs.totalRamGB - specs.usedRamGB) * 1024 * 1024 * 1024;
+      final requiredRamBytes = validation.fileSize + (activeContextSize * 1024 * 4) + (500 * 1024 * 1024);
+
+      if (availableRamBytes < requiredRamBytes) {
+        final reqGB = (requiredRamBytes / (1024 * 1024 * 1024)).toStringAsFixed(1);
+        final availGB = (availableRamBytes / (1024 * 1024 * 1024)).toStringAsFixed(1);
+        await _setCrashMarker("STAGE_RAM_INSUFFICIENT: req=$reqGB GB, avail=$availGB GB");
+        throw Exception("Insufficient RAM to load model safely ($reqGB GB required, ~$availGB GB available). Low-memory safeguard blocked allocation.");
+      }
+    } catch (e) {
+      debugPrint("[LLM] RAM check note: $e");
+    }
+
+    // 3. Preload Libraries safely & set target library
+    await _setCrashMarker("STAGE_PRELOAD_LIBRARIES");
+    _preloadLibraries();
+    Llama.libraryPath = Platform.isAndroid ? "libllama.so" : null;
+
+    try {
+      await _setCrashMarker("STAGE_CONTEXT_PARAMS_BUILD");
+      final samplerParams = SamplerParams()
+        ..temp = infSettings.temperature
+        ..topP = infSettings.topP
+        ..topK = infSettings.topK
+        ..penaltyRepeat = infSettings.repeatPenalty;
+
       final loadCommand = LlamaLoad(
         path: modelPath,
-        modelParams: ModelParams()..nGpuLayers = 0,
+        modelParams: ModelParams()..nGpuLayers = 0, // CPU-only mode for stability
         contextParams: ContextParams()
-          ..nCtx = nCtx
-          ..nThreads = nThreads
+          ..nCtx = activeContextSize
+          ..nThreads = activeThreadCount
           ..nBatch = 512,
-        samplingParams: SamplerParams(),
+        samplingParams: samplerParams,
+        verbose: false,
       );
 
+      await _setCrashMarker("STAGE_LLAMA_PARENT_INIT");
       _llamaParent = LlamaParent(loadCommand);
       await _llamaParent!.init();
       _modelPath = modelPath;
 
       final elapsedMs = DateTime.now().difference(startTime).inMilliseconds;
-      debugPrint("[LocalMind] Step 4/4: llama.cpp engine initialized successfully in ${elapsedMs}ms.");
+      lastError = null;
+
+      await _setCrashMarker("STAGE_MODEL_READY");
+      debugPrint("[LLM] MODEL_LOADED=true");
+      debugPrint("[LLM] CONTEXT_CREATED nCtx=$activeContextSize, nThreads=$activeThreadCount, duration=${elapsedMs}ms");
     } catch (e, stackTrace) {
-      debugPrint("[LocalMind] [CRITICAL ERROR] Failed to initialize llama.cpp native engine: $e");
-      debugPrint("[LocalMind] Stack trace: $stackTrace");
+      lastError = e.toString();
+      await _setCrashMarker("STAGE_LLAMA_INIT_ERROR: $e");
+      debugPrint("[LLM] [CRITICAL ERROR] Failed to initialize llama.cpp native engine: $e");
+      debugPrint("[LLM] Stack trace: $stackTrace");
       _llamaParent = null;
       _modelPath = null;
       throw Exception("Failed to initialize local LLM engine ($e)");
@@ -143,71 +211,195 @@ class LocalLLMIO implements LocalLLM {
   }
 
   @override
-  Future<String> generateResponse(String prompt, String modelName, String modelPath) async {
-    return _lock.run(() async {
-      return await _generateResponseInternal(prompt, modelName, modelPath);
-    });
-  }
-
-  Future<String> _generateResponseInternal(String prompt, String modelName, String modelPath) async {
+  Stream<String> generateStream(String prompt, String modelName, String modelPath, {InferenceSettings? settings}) async* {
     if (_llamaParent == null || _modelPath != modelPath) {
-      await _loadModelInternal(modelPath);
+      await loadModel(modelPath, settings: settings);
     }
 
     if (_llamaParent == null) {
       throw Exception("Local model engine is not initialized.");
     }
 
+    await _setCrashMarker("STAGE_GENERATION_SUBMIT");
+    _isGenerating = true;
+    final controller = StreamController<String>();
+
     final startTime = DateTime.now();
-    debugPrint("[LocalMind] Inference Start - Prompt length: ${prompt.length} chars. Model: $modelName");
+    int tokensCount = 0;
+    bool isFirstToken = true;
 
-    final completer = Completer<String>();
-    final StringBuffer responseBuffer = StringBuffer();
-    StreamSubscription<String>? subscription;
+    debugPrint("[LLM] ACTIVE_MODEL=$modelName");
+    debugPrint("[LLM] PROMPT_CREATED length=${prompt.length}");
+    debugPrint("[LLM] GENERATION_START");
 
-    subscription = _llamaParent!.stream.listen(
+    StreamSubscription<String>? textSub;
+    StreamSubscription<CompletionEvent>? compSub;
+
+    textSub = _llamaParent!.stream.listen(
       (token) {
-        responseBuffer.write(token);
-      },
-      onError: (error, stackTrace) {
-        debugPrint("[LocalMind] Error during native token streaming: $error");
-        if (!completer.isCompleted) {
-          completer.completeError(error);
+        if (isFirstToken) {
+          isFirstToken = false;
+          final firstTokenMs = DateTime.now().difference(startTime).inMilliseconds;
+          lastFirstTokenTime = "${firstTokenMs}ms";
+          _setCrashMarker("STAGE_FIRST_TOKEN_RECEIVED");
+          debugPrint("[LLM] FIRST_TOKEN=${token.trim()} latency=${firstTokenMs}ms");
+        }
+
+        tokensCount++;
+
+        if (!controller.isClosed) {
+          controller.add(token);
         }
       },
-      onDone: () {
-        if (!completer.isCompleted) {
-          completer.complete(responseBuffer.toString().trim());
+      onError: (error) {
+        lastError = error.toString();
+        _setCrashMarker("STAGE_STREAM_ERROR: $error");
+        debugPrint("[LLM] STREAM_ERROR: $error");
+        if (!controller.isClosed) {
+          controller.addError(error);
         }
       },
-      cancelOnError: true,
+    );
+
+    compSub = _llamaParent!.completions.listen(
+      (event) {
+        _isGenerating = false;
+        final totalElapsedMs = DateTime.now().difference(startTime).inMilliseconds;
+        lastInferenceDurationMs = totalElapsedMs;
+        lastTokenCount = tokensCount;
+
+        _setCrashMarker("STAGE_GENERATION_COMPLETE");
+        debugPrint("[LLM] EOS");
+        debugPrint("[LLM] GENERATION_COMPLETE - $tokensCount tokens in ${totalElapsedMs}ms (${(tokensCount / (totalElapsedMs / 1000.0)).toStringAsFixed(1)} t/s)");
+
+        if (!event.success && event.errorDetails != null) {
+          lastError = event.errorDetails;
+          if (!controller.isClosed) {
+            controller.addError(Exception("Inference error: ${event.errorDetails}"));
+          }
+        }
+
+        textSub?.cancel();
+        compSub?.cancel();
+        if (!controller.isClosed) {
+          controller.close();
+        }
+      },
     );
 
     try {
-      _llamaParent!.sendPrompt(prompt);
+      await _setCrashMarker("STAGE_SEND_PROMPT_NATIVE");
+      await _llamaParent!.sendPrompt(prompt);
+    } catch (e) {
+      _isGenerating = false;
+      lastError = e.toString();
+      await _setCrashMarker("STAGE_SEND_PROMPT_ERROR: $e");
+      await textSub.cancel();
+      await compSub.cancel();
+      if (!controller.isClosed) {
+        controller.addError(e);
+        await controller.close();
+      }
+    }
 
-      // Enforce 60-second timeout on local inference to prevent infinite freezes
-      final response = await completer.future.timeout(
-        const Duration(seconds: 60),
-        onTimeout: () {
-          debugPrint("[LocalMind] [TIMEOUT] Inference timed out after 60 seconds.");
-          if (responseBuffer.isNotEmpty) {
-            return responseBuffer.toString().trim();
+    yield* controller.stream;
+  }
+
+  @override
+  Future<String> generateResponse(String prompt, String modelName, String modelPath, {InferenceSettings? settings}) async {
+    return _lock.run(() async {
+      final buffer = StringBuffer();
+      final completer = Completer<String>();
+
+      if (_llamaParent == null || _modelPath != modelPath) {
+        await _loadModelInternal(modelPath, settings: settings);
+      }
+
+      if (_llamaParent == null) {
+        throw Exception("Local model engine is not initialized.");
+      }
+
+      await _setCrashMarker("STAGE_RESPONSE_GENERATE_SUBMIT");
+      final startTime = DateTime.now();
+      int tokensCount = 0;
+      bool isFirstToken = true;
+
+      debugPrint("[LLM] ACTIVE_MODEL=$modelName");
+      debugPrint("[LLM] PROMPT_CREATED length=${prompt.length}");
+
+      StreamSubscription<String>? textSub;
+      StreamSubscription<CompletionEvent>? compSub;
+
+      textSub = _llamaParent!.stream.listen((token) {
+        if (isFirstToken) {
+          isFirstToken = false;
+          final firstTokenMs = DateTime.now().difference(startTime).inMilliseconds;
+          lastFirstTokenTime = "${firstTokenMs}ms";
+          _setCrashMarker("STAGE_FIRST_TOKEN_RECEIVED");
+        }
+        tokensCount++;
+        buffer.write(token);
+      });
+
+      compSub = _llamaParent!.completions.listen((event) {
+        textSub?.cancel();
+        compSub?.cancel();
+
+        final totalElapsedMs = DateTime.now().difference(startTime).inMilliseconds;
+        lastInferenceDurationMs = totalElapsedMs;
+        lastTokenCount = tokensCount;
+
+        _setCrashMarker("STAGE_GENERATION_COMPLETE");
+        debugPrint("[LLM] EOS");
+
+        if (event.success) {
+          if (!completer.isCompleted) {
+            completer.complete(buffer.toString().trim());
           }
-          throw TimeoutException("Local inference timed out.");
-        },
-      );
+        } else {
+          lastError = event.errorDetails;
+          if (!completer.isCompleted) {
+            completer.completeError(Exception("Inference error: ${event.errorDetails}"));
+          }
+        }
+      });
 
-      final elapsedMs = DateTime.now().difference(startTime).inMilliseconds;
-      debugPrint("[LocalMind] Inference Completed in ${elapsedMs}ms. Output length: ${response.length} chars.");
+      try {
+        await _setCrashMarker("STAGE_SEND_PROMPT_NATIVE");
+        await _llamaParent!.sendPrompt(prompt);
 
-      await subscription.cancel();
-      return response;
-    } catch (e, stackTrace) {
-      await subscription.cancel();
-      debugPrint("[LocalMind] Exception in local response generation: $e");
-      debugPrint("[LocalMind] Stack trace: $stackTrace");
-      rethrow;
+        final response = await completer.future.timeout(
+          const Duration(seconds: 90),
+          onTimeout: () {
+            textSub?.cancel();
+            compSub?.cancel();
+            if (buffer.isNotEmpty) {
+              return buffer.toString().trim();
+            }
+            throw TimeoutException("Local inference timed out after 90 seconds.");
+          },
+        );
+
+        return response;
+      } catch (e) {
+        await textSub.cancel();
+        await compSub.cancel();
+        lastError = e.toString();
+        await _setCrashMarker("STAGE_RESPONSE_ERROR: $e");
+        debugPrint("[LLM] Exception during response generation: $e");
+        rethrow;
+      }
+    });
+  }
+
+  @override
+  void stopGeneration() {
+    if (_isGenerating) {
+      _isGenerating = false;
+      _activeSubscription?.cancel();
+      _activeSubscription = null;
+      _setCrashMarker("STAGE_STOP_GENERATION");
+      debugPrint("[LLM] User stopped generation.");
     }
   }
 
@@ -219,19 +411,42 @@ class LocalLLMIO implements LocalLLM {
   }
 
   Future<void> _unloadModelInternal() async {
+    await _setCrashMarker("STAGE_UNLOAD_START");
+    stopGeneration();
     if (_llamaParent != null) {
-      debugPrint("[LocalMind] Unloading local LLM model from memory...");
+      debugPrint("[LLM] UNLOADING_MODEL: $_modelPath");
       try {
         _llamaParent!.dispose();
       } catch (e) {
-        debugPrint("[LocalMind] Error disposing LlamaParent: $e");
+        debugPrint("[LLM] Error disposing LlamaParent: $e");
       }
       _llamaParent = null;
     }
     _modelPath = null;
-    debugPrint("[LocalMind] Model unloaded.");
+    await _setCrashMarker("IDLE");
+    debugPrint("[LLM] MODEL_UNLOADED=true");
   }
 
   @override
   bool get isModelLoaded => _llamaParent != null;
+
+  @override
+  LLMDiagnostics getDiagnostics() {
+    final tps = (lastInferenceDurationMs > 0 && lastTokenCount > 0)
+        ? (lastTokenCount / (lastInferenceDurationMs / 1000.0))
+        : 0.0;
+
+    return LLMDiagnostics(
+      activeModelPath: _modelPath,
+      isLoaded: isModelLoaded,
+      activeContextSize: activeContextSize,
+      activeThreadCount: activeThreadCount,
+      lastInferenceDurationMs: lastInferenceDurationMs,
+      lastTokenCount: lastTokenCount,
+      tokensPerSecond: tps,
+      lastFirstTokenLatency: lastFirstTokenTime,
+      lastError: lastError,
+      lastCrashMarker: lastCrashMarker,
+    );
+  }
 }

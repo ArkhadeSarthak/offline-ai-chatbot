@@ -14,10 +14,9 @@ void main() {
     // Verify that the title "LocalMind" is displayed in the AppBar.
     expect(find.descendant(of: find.byType(AppBar), matching: find.text('LocalMind')), findsOneWidget);
 
-    // Verify that bottom navigation items (Models, Downloads, Chat, Settings) are present.
+    // Verify that 3 bottom navigation items (Models, CHAT, Settings) are present.
     expect(find.text('Models'), findsOneWidget);
-    expect(find.text('Downloads'), findsOneWidget);
-    expect(find.text('Chat'), findsOneWidget);
+    expect(find.text('CHAT'), findsOneWidget);
     expect(find.text('Settings'), findsOneWidget);
   });
 }

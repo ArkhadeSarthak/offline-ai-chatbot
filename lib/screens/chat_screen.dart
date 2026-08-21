@@ -1,11 +1,15 @@
 import 'dart:convert';
 import 'dart:ui';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:google_fonts/google_fonts.dart';
 import 'package:provider/provider.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import '../models/ai_model.dart';
 import '../services/model_app_state.dart';
+import '../services/prompt_builder.dart';
+import '../widgets/formatted_response_view.dart';
+import '../widgets/app_feedback_service.dart';
 
 class ChatMessageDto {
   final String id;
@@ -70,12 +74,6 @@ class _ChatScreenState extends State<ChatScreen>
   String? _activeThreadId;
   String? _selectedModelId;
   bool _isGeneratingLocal = false;
-
-  List<AIModel> get _allSelectableModels {
-    final List<AIModel> list = [];
-    list.addAll(widget.installedModels);
-    return list;
-  }
 
   late AnimationController _sidebarAnimationController;
   late Animation<double> _sidebarAnimation;
@@ -200,7 +198,7 @@ class _ChatScreenState extends State<ChatScreen>
       if (_scrollController.hasClients) {
         _scrollController.animateTo(
           _scrollController.position.maxScrollExtent,
-          duration: const Duration(milliseconds: 300),
+          duration: const Duration(milliseconds: 200),
           curve: Curves.easeOut,
         );
       }
@@ -234,9 +232,9 @@ class _ChatScreenState extends State<ChatScreen>
                   const SizedBox(width: 8),
                   Expanded(
                     child: Text(
-                      'Local Model Needed',
-                      style:
-                          GoogleFonts.spaceGrotesk(fontWeight: FontWeight.bold),
+                      'Model Unavailable',
+                      style: GoogleFonts.spaceGrotesk(
+                          fontWeight: FontWeight.bold, fontSize: 17),
                     ),
                   ),
                 ],
@@ -244,7 +242,7 @@ class _ChatScreenState extends State<ChatScreen>
               content: Text(
                 message,
                 style: GoogleFonts.inter(
-                    fontSize: 13,
+                    fontSize: 11,
                     color: theme.colorScheme.onSurface.withOpacity(0.7)),
               ),
               actions: [
@@ -265,8 +263,8 @@ class _ChatScreenState extends State<ChatScreen>
     );
   }
 
-  void _handleSubmit() async {
-    final text = _inputController.text.trim();
+  void _handleSubmit({String? overrideText}) async {
+    final text = (overrideText ?? _inputController.text).trim();
     if (text.isEmpty || _isGeneratingLocal) return;
 
     final modelAppState = Provider.of<ModelAppState>(context, listen: false);
@@ -275,7 +273,7 @@ class _ChatScreenState extends State<ChatScreen>
     final selectedId = _selectedModelId ?? modelAppState.selectedModelId;
     if (selectedId == null || modelAppState.installedModels.isEmpty) {
       _showNoModelDialog(
-          "No models installed. Please go to the Models tab to download an offline AI model.");
+          "No models installed. Download an offline model from the Models tab first.");
       return;
     }
 
@@ -283,7 +281,7 @@ class _ChatScreenState extends State<ChatScreen>
         await modelAppState.modelManager.isModelInstalled(selectedId);
     if (!isInstalled) {
       _showNoModelDialog(
-          "The selected model is not installed. Please download it first from the Models tab.");
+          "Model is not installed. Please download it first from the Models tab.");
       return;
     }
 
@@ -305,76 +303,163 @@ class _ChatScreenState extends State<ChatScreen>
     final activeThread = safeThreads.firstWhere((t) => t.id == _activeThreadId,
         orElse: () => safeThreads.first);
 
+    final userMsgTime =
+        '${DateTime.now().hour.toString().padLeft(2, '0')}:${DateTime.now().minute.toString().padLeft(2, '0')}';
+    final botMsgId = 'msg-bot-${DateTime.now().millisecondsSinceEpoch}';
+
+    // Prepare conversation history items
+    final List<ChatMessageItem> historyList = activeThread.messages
+        .where((m) => m.text.isNotEmpty && m.status != 'error')
+        .map((m) => ChatMessageItem(sender: m.sender, text: m.text))
+        .toList();
+
     setState(() {
+      if (overrideText == null) {
+        activeThread.messages.add(
+          ChatMessageDto(
+            id: 'msg-user-${DateTime.now().millisecondsSinceEpoch}',
+            sender: 'user',
+            text: text,
+            timestamp: userMsgTime,
+          ),
+        );
+      }
       activeThread.messages.add(
         ChatMessageDto(
-          id: 'msg-user-${DateTime.now().millisecondsSinceEpoch}',
-          sender: 'user',
-          text: text,
-          timestamp:
-              '${DateTime.now().hour.toString().padLeft(2, '0')}:${DateTime.now().minute.toString().padLeft(2, '0')}',
+          id: botMsgId,
+          sender: 'bot',
+          text: '',
+          timestamp: userMsgTime,
+          status: 'generating',
         ),
       );
       _isGeneratingLocal = true;
     });
     _saveThreads();
-    _inputController.clear();
+    if (overrideText == null) {
+      _inputController.clear();
+    }
     _scrollToBottom();
 
-    String botResponse = "";
+    final StringBuffer buffer = StringBuffer();
+    DateTime lastUIUpdate = DateTime.now();
+
     try {
-      // Ensure model is loaded in service
+      // Ensure model is loaded in LLM Service
       if (!modelAppState.llmService.isModelLoaded) {
         final path = await modelAppState.modelManager.getModelPath(selectedId);
         if (path != null) {
-          await modelAppState.llmService.loadModel(path);
+          final modelObj = modelAppState.models.firstWhere(
+              (m) => m.id == selectedId,
+              orElse: () => modelAppState.models.first);
+          await modelAppState.llmService.loadModel(
+            path,
+            modelName: modelObj.name,
+            chatTemplate: modelObj.chatTemplate,
+            settings: modelAppState.inferenceSettings,
+          );
         }
       }
 
-      // Generate response from local LLM
-      botResponse = await modelAppState.llmService.generateResponse(text);
-    } catch (e) {
-      botResponse = "Error generating response: $e";
-    }
-
-    setState(() {
-      activeThread.messages.add(
-        ChatMessageDto(
-          id: 'msg-bot-${DateTime.now().millisecondsSinceEpoch}',
-          sender: 'bot',
-          text: botResponse,
-          timestamp:
-              '${DateTime.now().hour.toString().padLeft(2, '0')}:${DateTime.now().minute.toString().padLeft(2, '0')}',
-        ),
+      final activeModelObj = modelAppState.models.firstWhere(
+        (m) => m.id == selectedId,
+        orElse: () => modelAppState.models.first,
       );
-      _isGeneratingLocal = false;
-    });
 
-    _saveThreads();
-    _scrollToBottom();
+      await for (final token in modelAppState.llmService.generateStream(
+        text,
+        chatTemplate: activeModelObj.chatTemplate,
+        history: historyList,
+        settings: modelAppState.inferenceSettings,
+      )) {
+        buffer.write(token);
+
+        final now = DateTime.now();
+        // Throttled UI update (every ~50ms) to maintain smooth rendering
+        if (now.difference(lastUIUpdate).inMilliseconds >= 50) {
+          lastUIUpdate = now;
+          final index = activeThread.messages.indexWhere((m) => m.id == botMsgId);
+          if (index != -1 && mounted) {
+            setState(() {
+              activeThread.messages[index] = ChatMessageDto(
+                id: botMsgId,
+                sender: 'bot',
+                text: buffer.toString(),
+                timestamp: userMsgTime,
+                status: 'generating',
+              );
+            });
+            _scrollToBottom();
+          }
+        }
+      }
+
+      // Final completion state update
+      final finalText = buffer.toString().trim();
+      final index = activeThread.messages.indexWhere((m) => m.id == botMsgId);
+      if (index != -1 && mounted) {
+        setState(() {
+          activeThread.messages[index] = ChatMessageDto(
+            id: botMsgId,
+            sender: 'bot',
+            text: finalText.isNotEmpty
+                ? finalText
+                : "Local AI could not generate a response.",
+            timestamp: userMsgTime,
+            status: finalText.isNotEmpty ? 'success' : 'error',
+          );
+        });
+      }
+    } catch (e) {
+      debugPrint("[LocalMind] Inference Exception: $e");
+      final index = activeThread.messages.indexWhere((m) => m.id == botMsgId);
+      if (index != -1 && mounted) {
+        final currentText = buffer.toString().trim();
+        setState(() {
+          activeThread.messages[index] = ChatMessageDto(
+            id: botMsgId,
+            sender: 'bot',
+            text: currentText.isNotEmpty ? currentText : "Local AI error: $e",
+            timestamp: userMsgTime,
+            status: 'error',
+          );
+        });
+      }
+    } finally {
+      if (mounted) {
+        setState(() {
+          _isGeneratingLocal = false;
+        });
+        _saveThreads();
+        _scrollToBottom();
+      }
+    }
   }
 
-  void _startNewChat() {
-    final newId = 'thread-${DateTime.now().millisecondsSinceEpoch}';
-    final newThread = ChatThread(
-      id: newId,
-      title: 'New Discussion',
-      messages: [
-        ChatMessageDto(
-          id: 'msg-init-${DateTime.now().millisecondsSinceEpoch}',
-          sender: 'bot',
-          text: 'How can I assist you today?',
-          timestamp:
-              '${DateTime.now().hour.toString().padLeft(2, '0')}:${DateTime.now().minute.toString().padLeft(2, '0')}',
-        ),
-      ],
-    );
+  void _handleRetry(ChatMessageDto failedBotMsg) {
+    if (_isGeneratingLocal || _activeThreadId == null) return;
+    final safeThreads = _threads;
+    if (safeThreads.isEmpty) return;
+    final activeThread = safeThreads.firstWhere((t) => t.id == _activeThreadId,
+        orElse: () => safeThreads.first);
+
+    final failedIndex = activeThread.messages.indexWhere((m) => m.id == failedBotMsg.id);
+    if (failedIndex <= 0) return;
+
+    final userPromptMsg = activeThread.messages[failedIndex - 1];
+    if (userPromptMsg.sender != 'user') return;
+
+    // Remove the failed bot message
     setState(() {
-      _threads.add(newThread);
-      _activeThreadId = newId;
-      widget.onToggleSidebar(false);
+      activeThread.messages.removeAt(failedIndex);
     });
-    _saveThreads();
+
+    _handleSubmit(overrideText: userPromptMsg.text);
+  }
+
+  void _copyToClipboard(String text) {
+    Clipboard.setData(ClipboardData(text: text));
+    AppFeedbackService.showToast(context, 'Response copied to clipboard');
   }
 
   void _deleteThread(String threadId) {
@@ -412,7 +497,7 @@ class _ChatScreenState extends State<ChatScreen>
                 style: GoogleFonts.spaceGrotesk(fontWeight: FontWeight.bold),
               ),
               content: Text(
-                'Are you sure you want to delete this conversation? This cannot be undone.',
+                'Are you sure you want to delete this conversation? This action cannot be undone.',
                 style: GoogleFonts.inter(
                     fontSize: 13,
                     color: theme.colorScheme.onSurface.withOpacity(0.7)),
@@ -513,12 +598,12 @@ class _ChatScreenState extends State<ChatScreen>
   }
 
   Widget _buildEmptyState(ThemeData theme) {
-    // final suggestions = [
-    //   "Explain edge computing simply",
-    //   "Dart singleton pattern example",
-    //   "Benefits of offline local AI",
-    //   "Suggest a core workout routine",
-    // ];
+    final suggestions = [
+      'What can you do offline?',
+      'Explain quantum computing simply',
+      'Write a clean Dart function',
+      'Help me draft an email',
+    ];
 
     return Center(
       child: SingleChildScrollView(
@@ -527,12 +612,12 @@ class _ChatScreenState extends State<ChatScreen>
           mainAxisAlignment: MainAxisAlignment.center,
           children: [
             Container(
-              padding: const EdgeInsets.all(20),
+              padding: const EdgeInsets.all(22),
               decoration: BoxDecoration(
-                color: theme.colorScheme.primary.withOpacity(0.08),
+                color: theme.colorScheme.primary.withValues(alpha: 0.1),
                 shape: BoxShape.circle,
                 border: Border.all(
-                    color: theme.colorScheme.primary.withOpacity(0.15)),
+                    color: theme.colorScheme.primary.withValues(alpha: 0.2)),
               ),
               child: Image.asset(
                 'assets/images/Icon.png',
@@ -541,7 +626,7 @@ class _ChatScreenState extends State<ChatScreen>
                 fit: BoxFit.cover,
                 errorBuilder: (context, error, stackTrace) {
                   return Icon(
-                    Icons.psychology,
+                    Icons.psychology_rounded,
                     color: theme.colorScheme.primary,
                     size: 48,
                   );
@@ -552,81 +637,58 @@ class _ChatScreenState extends State<ChatScreen>
             Text(
               'LocalMind',
               style: GoogleFonts.spaceGrotesk(
-                  fontSize: 22,
+                  fontSize: 24,
                   fontWeight: FontWeight.bold,
                   color: theme.colorScheme.onSurface),
             ),
-            const SizedBox(height: 8),
+            const SizedBox(height: 6),
             Text(
-              'Ask anything that you want to get explained.',
+              'Your Private AI • 100% On-Device Inference',
               textAlign: TextAlign.center,
               style: GoogleFonts.inter(
                   fontSize: 13,
-                  color: theme.colorScheme.onSurface.withOpacity(0.6)),
+                  color: theme.colorScheme.onSurface.withValues(alpha: 0.6)),
             ),
-            const SizedBox(height: 32),
-            // ConstrainedBox(
-            //   constraints: const BoxConstraints(maxWidth: 450),
-            //   child: GridView.builder(
-            //     shrinkWrap: true,
-            //     physics: const NeverScrollableScrollPhysics(),
-            //     gridDelegate: const SliverGridDelegateWithFixedCrossAxisCount(
-            //       crossAxisCount: 2,
-            //       crossAxisSpacing: 12,
-            //       mainAxisSpacing: 12,
-            //       childAspectRatio: 1.6,
-            //     ),
-            //     itemCount: suggestions.length,
-            //     itemBuilder: (context, index) {
-            //       final text = suggestions[index];
-            //       return InkWell(
-            //         onTap: () {
-            //           if (_activeThreadId == null) {
-            //             _startNewChat();
-            //           }
-            //           _inputController.text = text;
-            //           _handleSubmit();
-            //         },
-            //         borderRadius: BorderRadius.circular(12),
-            //         child: Container(
-            //           padding: const EdgeInsets.all(12),
-            //           decoration: BoxDecoration(
-            //             color: theme.colorScheme.surface,
-            //             border: Border.all(
-            //                 color: theme.colorScheme.outline.withOpacity(0.15)),
-            //             borderRadius: BorderRadius.circular(12),
-            //             boxShadow: [
-            //               BoxShadow(
-            //                 color: Colors.black.withOpacity(0.03),
-            //                 blurRadius: 4,
-            //                 offset: const Offset(0, 2),
-            //               )
-            //             ],
-            //           ),
-            //           child: Column(
-            //             crossAxisAlignment: CrossAxisAlignment.start,
-            //             children: [
-            //               Icon(Icons.bolt,
-            //                   size: 16, color: theme.colorScheme.secondary),
-            //               const Spacer(),
-            //               Text(
-            //                 text,
-            //                 style: GoogleFonts.inter(
-            //                   fontSize: 11,
-            //                   fontWeight: FontWeight.w500,
-            //                   color:
-            //                       theme.colorScheme.onSurface.withOpacity(0.8),
-            //                 ),
-            //                 maxLines: 3,
-            //                 overflow: TextOverflow.ellipsis,
-            //               ),
-            //             ],
-            //           ),
-            //         ),
-            //       );
-            //     },
-            //   ),
-            // ),
+            const SizedBox(height: 24),
+            Wrap(
+              spacing: 8,
+              runSpacing: 8,
+              alignment: WrapAlignment.center,
+              children: suggestions.map((prompt) {
+                return InkWell(
+                  onTap: () {
+                    HapticFeedback.lightImpact();
+                    _inputController.text = prompt;
+                  },
+                  borderRadius: BorderRadius.circular(20),
+                  child: Container(
+                    padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 8),
+                    decoration: BoxDecoration(
+                      color: theme.colorScheme.surface,
+                      borderRadius: BorderRadius.circular(20),
+                      border: Border.all(
+                        color: theme.colorScheme.outline.withValues(alpha: 0.2),
+                      ),
+                    ),
+                    child: Row(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        Icon(Icons.auto_awesome_outlined, size: 14, color: theme.colorScheme.primary),
+                        const SizedBox(width: 6),
+                        Text(
+                          prompt,
+                          style: GoogleFonts.inter(
+                            fontSize: 12,
+                            fontWeight: FontWeight.w500,
+                            color: theme.colorScheme.onSurface,
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                );
+              }).toList(),
+            ),
           ],
         ),
       ),
@@ -915,13 +977,30 @@ class _ChatScreenState extends State<ChatScreen>
                               ),
                             );
                           }).toList(),
-                          onChanged: (String? newValue) {
+                          onChanged: (String? newValue) async {
                             if (newValue != null) {
+                              final state = Provider.of<ModelAppState>(context, listen: false);
+                              final modelObj = state.models.firstWhere((m) => m.id == newValue, orElse: () => state.models.first);
+                              final eval = await state.evaluateModelMemory(modelObj);
+                              if (!context.mounted) return;
+                              if (eval.isUnsafe || eval.isCaution) {
+                                final action = await AppFeedbackService.showLowMemoryWarning(
+                                  context,
+                                  modelName: modelObj.name,
+                                  message: eval.message,
+                                );
+                                if (action == 'cancel') return;
+                                final useSafeMode = (action == 'safe_mode');
+                                setState(() {
+                                  _selectedModelId = newValue;
+                                });
+                                await state.selectModel(newValue, forceSafeMode: useSafeMode);
+                                return;
+                              }
                               setState(() {
                                 _selectedModelId = newValue;
                               });
-                              Provider.of<ModelAppState>(context, listen: false)
-                                  .selectModel(newValue);
+                              await state.selectModel(newValue);
                             }
                           },
                         ),
@@ -965,88 +1044,11 @@ class _ChatScreenState extends State<ChatScreen>
     );
   }
 
-  String _preprocessText(String text) {
-    // Add line break before numbered points (if not at the start of text and not already after a newline)
-    String processed = text.replaceAllMapped(RegExp(r'(\d+\.\s)'), (match) {
-      if (match.start == 0) {
-        return match.group(1)!;
-      }
-      final beforeMatch = text.substring(0, match.start);
-      if (beforeMatch.endsWith('\n') || beforeMatch.trim().endsWith('\n')) {
-        return match.group(1)!;
-      }
-      return '\n${match.group(1)}';
-    });
-
-    // Process bullet points line-by-line
-    final lines = processed.split('\n');
-    final bulletRegex = RegExp(r'^\s*[\*-]\s+');
-    for (int i = 0; i < lines.length; i++) {
-      if (bulletRegex.hasMatch(lines[i])) {
-        lines[i] = lines[i].replaceFirst(bulletRegex, '• ');
-      }
-    }
-
-    return lines.join('\n');
-  }
-
-  List<InlineSpan> _parseInlineSpans(String text, TextStyle defaultStyle) {
-    final spans = <InlineSpan>[];
-    final regex = RegExp(r'(\*\*.*?\*\*)|(\*.*?\*)');
-    int start = 0;
-
-    for (final match in regex.allMatches(text)) {
-      if (match.start > start) {
-        spans.add(TextSpan(
-          text: text.substring(start, match.start),
-          style: defaultStyle,
-        ));
-      }
-
-      final matchText = match.group(0)!;
-      if (matchText.startsWith('**') && matchText.endsWith('**')) {
-        final innerText = matchText.substring(2, matchText.length - 2);
-        spans.add(TextSpan(
-          text: innerText,
-          style: defaultStyle.copyWith(fontWeight: FontWeight.bold),
-        ));
-      } else if (matchText.startsWith('*') && matchText.endsWith('*')) {
-        final innerText = matchText.substring(1, matchText.length - 1);
-        spans.add(TextSpan(
-          text: innerText,
-          style: defaultStyle.copyWith(fontStyle: FontStyle.italic),
-        ));
-      }
-
-      start = match.end;
-    }
-
-    if (start < text.length) {
-      spans.add(TextSpan(
-        text: text.substring(start),
-        style: defaultStyle,
-      ));
-    }
-
-    return spans;
-  }
-
-  Widget _buildFormattedText(String text, bool isMe, ThemeData theme) {
-    final defaultStyle = GoogleFonts.inter(
-      fontSize: 13.5,
-      color: isMe ? Colors.black : theme.colorScheme.onSurface,
-      height: 1.45,
-    );
-
-    final preprocessed = _preprocessText(text);
-    final spans = _parseInlineSpans(preprocessed, defaultStyle);
-
-    return SelectableText.rich(
-      TextSpan(children: spans),
-    );
-  }
-
   Widget _buildMessageBubble(ChatMessageDto msg, bool isMe, ThemeData theme) {
+    final bool isThinking =
+        !isMe && msg.text.isEmpty && msg.status == 'generating';
+    final bool isError = msg.status == 'error';
+
     return Padding(
       padding: const EdgeInsets.only(bottom: 16.0),
       child: Row(
@@ -1058,6 +1060,7 @@ class _ChatScreenState extends State<ChatScreen>
           const SizedBox(width: 10),
           Flexible(
             child: Container(
+              constraints: const BoxConstraints(maxWidth: 600),
               padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
               decoration: BoxDecoration(
                 gradient: isMe
@@ -1074,7 +1077,9 @@ class _ChatScreenState extends State<ChatScreen>
                 border: isMe
                     ? null
                     : Border.all(
-                        color: theme.colorScheme.outline.withOpacity(0.12)),
+                        color: isError
+                            ? Colors.redAccent.withOpacity(0.5)
+                            : theme.colorScheme.outline.withOpacity(0.12)),
                 borderRadius: BorderRadius.only(
                   topLeft: isMe ? const Radius.circular(16) : Radius.zero,
                   topRight: isMe ? Radius.zero : const Radius.circular(16),
@@ -1090,63 +1095,78 @@ class _ChatScreenState extends State<ChatScreen>
                 ],
               ),
               child: Column(
+                mainAxisSize: MainAxisSize.min,
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
-                  _buildFormattedText(msg.text, isMe, theme),
-                  const SizedBox(height: 8),
-                  Row(
-                    mainAxisSize: MainAxisSize.min,
-                    children: [
-                      Text(
-                        msg.timestamp,
-                        style: GoogleFonts.jetBrainsMono(
-                          fontSize: 9,
-                          color: isMe
-                              ? Colors.black.withOpacity(0.6)
-                              : theme.colorScheme.onSurface.withOpacity(0.4),
-                          fontWeight: FontWeight.w500,
-                        ),
+                  if (isThinking)
+                    const PulseThinkingIndicator()
+                  else
+                    FormattedResponseView(
+                      text: msg.text,
+                      isMe: isMe,
+                      status: msg.status,
+                    ),
+
+                  if (msg.status == 'generating' && msg.text.isNotEmpty) ...[
+                    const SizedBox(height: 6),
+                    const PulseThinkingIndicator(),
+                  ],
+
+                  if (isError) ...[
+                    const SizedBox(height: 10),
+                    OutlinedButton.icon(
+                      onPressed: () => _handleRetry(msg),
+                      icon: const Icon(Icons.refresh_rounded, size: 14),
+                      label: const Text('Retry'),
+                      style: OutlinedButton.styleFrom(
+                        foregroundColor: Colors.redAccent,
+                        side: BorderSide(color: Colors.redAccent.withOpacity(0.4)),
+                        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+                        textStyle: GoogleFonts.inter(fontSize: 12, fontWeight: FontWeight.bold),
                       ),
-                      if (isMe) ...[
-                        const SizedBox(width: 6),
-                        const Icon(Icons.done_all,
-                            size: 12, color: Colors.black),
-                      ]
-                    ],
-                  ),
+                    ),
+                  ],
+
+                  if (msg.text.isNotEmpty) const SizedBox(height: 8),
+                  if (msg.text.isNotEmpty)
+                    Row(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        Text(
+                          msg.timestamp,
+                          style: GoogleFonts.jetBrainsMono(
+                            fontSize: 9,
+                            color: isMe
+                                ? Colors.black.withOpacity(0.6)
+                                : theme.colorScheme.onSurface.withOpacity(0.4),
+                            fontWeight: FontWeight.w500,
+                          ),
+                        ),
+                        if (!isMe && msg.text.isNotEmpty) ...[
+                          const SizedBox(width: 10),
+                          InkWell(
+                            onTap: () => _copyToClipboard(msg.text),
+                            borderRadius: BorderRadius.circular(4),
+                            child: Icon(
+                              Icons.copy_rounded,
+                              size: 13,
+                              color: theme.colorScheme.onSurface.withOpacity(0.5),
+                            ),
+                          ),
+                        ],
+                        if (isMe) ...[
+                          const SizedBox(width: 6),
+                          const Icon(Icons.done_all,
+                              size: 12, color: Colors.black),
+                        ],
+                      ],
+                    ),
                 ],
               ),
             ),
           ),
           const SizedBox(width: 10),
           if (isMe) _buildAvatar(Icons.person_outline, theme),
-        ],
-      ),
-    );
-  }
-
-  Widget _buildThinkingBubble(ThemeData theme) {
-    return Padding(
-      padding: const EdgeInsets.only(bottom: 16.0),
-      child: Row(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          _buildAvatar(Icons.android_outlined, theme),
-          const SizedBox(width: 10),
-          Container(
-            padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
-            decoration: BoxDecoration(
-              color: theme.colorScheme.surface,
-              border: Border.all(
-                  color: theme.colorScheme.outline.withOpacity(0.12)),
-              borderRadius: const BorderRadius.only(
-                topRight: Radius.circular(16),
-                bottomLeft: Radius.circular(16),
-                bottomRight: Radius.circular(16),
-              ),
-            ),
-            child: const PulseThinkingIndicator(),
-          ),
         ],
       ),
     );
@@ -1167,7 +1187,7 @@ class _ChatScreenState extends State<ChatScreen>
 
   Widget _buildInputArea(ThemeData theme) {
     return Container(
-      padding: const EdgeInsets.all(12),
+      padding: const EdgeInsets.fromLTRB(16, 6, 16, 6),
       decoration: BoxDecoration(
         gradient: LinearGradient(
           begin: Alignment.topCenter,
@@ -1229,17 +1249,34 @@ class _ChatScreenState extends State<ChatScreen>
                       ),
                     ),
                     InkWell(
-                      onTap: _handleSubmit,
+                      onTap: () {
+                        if (_isGeneratingLocal) {
+                          Provider.of<ModelAppState>(context, listen: false)
+                              .llmService
+                              .stopGeneration();
+                          setState(() {
+                            _isGeneratingLocal = false;
+                          });
+                        } else {
+                          _handleSubmit();
+                        }
+                      },
                       borderRadius: BorderRadius.circular(18),
                       child: Container(
                         width: 36,
                         height: 36,
                         decoration: BoxDecoration(
-                          color: theme.colorScheme.primary,
+                          color: _isGeneratingLocal
+                              ? Colors.redAccent
+                              : theme.colorScheme.primary,
                           shape: BoxShape.circle,
                         ),
-                        child: const Icon(Icons.arrow_upward,
-                            size: 18, color: Colors.black),
+                        child: Icon(
+                          _isGeneratingLocal ? Icons.stop_rounded : Icons.send,
+                          size: 18,
+                          color:
+                              _isGeneratingLocal ? Colors.white : Colors.black,
+                        ),
                       ),
                     ),
                   ],
@@ -1298,15 +1335,11 @@ class _ChatScreenState extends State<ChatScreen>
                         padding: const EdgeInsets.only(
                           left: 16.0,
                           right: 16.0,
-                          top: 48.0, // Space for the floating menu button
-                          bottom: 96.0, // Bottom padding to not obscure content behind transparent input
+                          top: 48.0, // Space for floating menu button
+                          bottom: 96.0, // Bottom padding for floating input
                         ),
-                        itemCount: activeThread.messages.length +
-                            (_isGeneratingLocal ? 1 : 0),
+                        itemCount: activeThread.messages.length,
                         itemBuilder: (context, index) {
-                          if (index == activeThread.messages.length) {
-                            return _buildThinkingBubble(theme);
-                          }
                           final msg = activeThread.messages[index];
                           final isMe = msg.sender == 'user';
                           return _buildMessageBubble(msg, isMe, theme);
@@ -1371,9 +1404,8 @@ class _ChatScreenState extends State<ChatScreen>
             builder: (context, child) {
               final double animVal = _sidebarAnimation.value;
               final bool isSidebarVisible = animVal > 0.05;
-              // Moves from left: 4.0 to left: 220.0 (inside sidebar top right)
               final double buttonLeft = 4.0 + 216.0 * animVal;
-              final double buttonTop = 4.0;
+              const double buttonTop = 4.0;
 
               return Positioned(
                 left: buttonLeft,
@@ -1497,5 +1529,3 @@ class _PulseThinkingIndicatorState extends State<PulseThinkingIndicator>
     );
   }
 }
-
-export_chat_example() {}

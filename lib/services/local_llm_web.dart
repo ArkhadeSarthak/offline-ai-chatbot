@@ -1,30 +1,50 @@
+import 'dart:async';
 import 'local_llm_helper.dart';
+import 'settings_service.dart';
 
 LocalLLM getPlatformLLM() => LocalLLMWeb();
 
 class LocalLLMWeb implements LocalLLM {
   bool _loaded = false;
+  bool _isCancelled = false;
 
   @override
-  Future<void> loadModel(String modelPath) async {
+  Future<void> loadModel(String modelPath, {InferenceSettings? settings}) async {
     _loaded = true;
   }
 
   @override
-  Future<String> generateResponse(String prompt, String modelName, String modelPath) async {
-    await Future.delayed(const Duration(seconds: 2));
-    final promptLower = prompt.toLowerCase();
-    if (promptLower.contains("hello") || promptLower.contains("hi")) {
-      return "Hello! I am $modelName, running locally on your device. How can I assist you offline today?";
-    } else if (promptLower.contains("name")) {
-      return "I am $modelName, an offline-optimized AI model currently loaded from device storage at `$modelPath`.";
-    } else if (promptLower.contains("weather")) {
-      return "I cannot check live weather reports because I am currently operating offline. Please check your internet connection.";
-    } else if (promptLower.contains("code") || promptLower.contains("program") || promptLower.contains("write a")) {
-      return "Here is a quick code template for you:\n\n```javascript\n// Offline code assistance template\nfunction greet(name) {\n  return `Hello, \${name}!`;\n}\nconsole.log(greet('World'));\n```\n\nTo compile complex code offline, you can run native execution targets on device hardware.";
-    } else {
-      return "I received your offline prompt: \"$prompt\". As $modelName, I am running completely locally off your device storage.";
+  Future<String> generateResponse(String prompt, String modelName, String modelPath, {InferenceSettings? settings}) async {
+    final buffer = StringBuffer();
+    await for (final token in generateStream(prompt, modelName, modelPath, settings: settings)) {
+      buffer.write(token);
     }
+    return buffer.toString().trim();
+  }
+
+  @override
+  Stream<String> generateStream(String prompt, String modelName, String modelPath, {InferenceSettings? settings}) async* {
+    _isCancelled = false;
+    final promptLower = prompt.toLowerCase();
+    String fullResponse = "I received your offline prompt: \"$prompt\". As $modelName, I am running completely locally.";
+    
+    if (promptLower.contains("hello") || promptLower.contains("hi")) {
+      fullResponse = "Hello! I am $modelName, running locally on your device. How can I assist you offline today?";
+    } else if (promptLower.contains("flutter")) {
+      fullResponse = "Flutter is an open-source UI software development kit created by Google for building natively compiled applications.";
+    }
+
+    final words = fullResponse.split(' ');
+    for (int i = 0; i < words.length; i++) {
+      if (_isCancelled) break;
+      await Future.delayed(const Duration(milliseconds: 30));
+      yield words[i] + (i < words.length - 1 ? ' ' : '');
+    }
+  }
+
+  @override
+  void stopGeneration() {
+    _isCancelled = true;
   }
 
   @override
@@ -34,4 +54,20 @@ class LocalLLMWeb implements LocalLLM {
 
   @override
   bool get isModelLoaded => _loaded;
+
+  @override
+  LLMDiagnostics getDiagnostics() {
+    return LLMDiagnostics(
+      activeModelPath: "web_demo",
+      isLoaded: _loaded,
+      activeContextSize: 2048,
+      activeThreadCount: 1,
+      lastInferenceDurationMs: 300,
+      lastTokenCount: 10,
+      tokensPerSecond: 33.3,
+      lastFirstTokenLatency: "30ms",
+      lastError: null,
+      lastCrashMarker: "IDLE",
+    );
+  }
 }

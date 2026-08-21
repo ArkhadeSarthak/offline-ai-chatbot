@@ -3,10 +3,10 @@ import 'package:flutter/foundation.dart';
 import 'device_info_helper.dart';
 
 Future<DeviceSpecs> getPlatformSpecs() async {
-  double totalStorage = 256.0;
-  double freeStorage = 120.0;
-  double totalRam = 8.0;
-  double usedRam = 4.2;
+  double totalStorage = 64.0;
+  double freeStorage = 32.0;
+  double totalRam = 6.0;
+  double usedRam = 3.0;
 
   try {
     if (Platform.isWindows) {
@@ -46,7 +46,7 @@ Future<DeviceSpecs> getPlatformSpecs() async {
         }
       }
 
-      usedRam = totalRam * 0.48; // Estimate typical system load
+      usedRam = totalRam * 0.50;
     } else if (Platform.isMacOS) {
       final ramResult = await Process.run('sysctl', ['-n', 'hw.memsize']);
       if (ramResult.exitCode == 0) {
@@ -55,33 +55,35 @@ Future<DeviceSpecs> getPlatformSpecs() async {
           totalRam = bytes / (1024.0 * 1024.0 * 1024.0);
         }
       }
-      usedRam = totalRam * 0.52;
-    } else if (Platform.isLinux) {
-      final file = File('/proc/meminfo');
-      if (await file.exists()) {
-        final lines = await file.readAsLines();
+      usedRam = totalRam * 0.50;
+    } else if (Platform.isLinux || Platform.isAndroid) {
+      final meminfo = File('/proc/meminfo');
+      if (await meminfo.exists()) {
+        final lines = await meminfo.readAsLines();
+        double? memTotalKb;
+        double? memAvailKb;
         for (var line in lines) {
           if (line.startsWith('MemTotal:')) {
             final parts = line.split(RegExp(r'\s+'));
-            if (parts.length >= 2) {
-              final kb = double.tryParse(parts[1]);
-              if (kb != null) {
-                totalRam = kb / (1024.0 * 1024.0);
-              }
-            }
-            break;
+            if (parts.length >= 2) memTotalKb = double.tryParse(parts[1]);
+          } else if (line.startsWith('MemAvailable:')) {
+            final parts = line.split(RegExp(r'\s+'));
+            if (parts.length >= 2) memAvailKb = double.tryParse(parts[1]);
+          }
+        }
+        if (memTotalKb != null) {
+          totalRam = memTotalKb / (1024.0 * 1024.0);
+          if (memAvailKb != null) {
+            final freeRam = memAvailKb / (1024.0 * 1024.0);
+            usedRam = (totalRam - freeRam).clamp(0.1, totalRam);
+          } else {
+            usedRam = totalRam * 0.55;
           }
         }
       }
-      usedRam = totalRam * 0.45;
-    } else if (Platform.isAndroid || Platform.isIOS) {
-      totalStorage = 128.0;
-      freeStorage = 74.0;
-      totalRam = 6.0;
-      usedRam = 3.1;
     }
   } catch (e) {
-    debugPrint("Error loading device specifications on native: $e");
+    debugPrint("Error loading device specifications: $e");
   }
 
   return DeviceSpecs(

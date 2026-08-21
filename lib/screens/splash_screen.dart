@@ -27,7 +27,7 @@ class _SplashScreenState extends State<SplashScreen>
     super.initState();
     _animationController = AnimationController(
       vsync: this,
-      duration: const Duration(milliseconds: 1500),
+      duration: const Duration(milliseconds: 1200),
     );
 
     _fadeAnimation = Tween<double>(begin: 0.0, end: 1.0).animate(
@@ -37,17 +37,17 @@ class _SplashScreenState extends State<SplashScreen>
       ),
     );
 
-    _scaleAnimation = Tween<double>(begin: 0.8, end: 1.0).animate(
+    _scaleAnimation = Tween<double>(begin: 0.85, end: 1.0).animate(
       CurvedAnimation(
         parent: _animationController,
-        curve: const Interval(0.0, 0.8, curve: Curves.elasticOut),
+        curve: const Interval(0.0, 0.8, curve: Curves.easeOutCubic),
       ),
     );
 
     _animationController.forward();
 
-    // Navigate to MainNavigationShell after 3 seconds
-    Future.delayed(const Duration(seconds: 3), () {
+    // Navigate to MainNavigationShell after 2.5 seconds
+    Future.delayed(const Duration(milliseconds: 2500), () {
       if (mounted) {
         Navigator.of(context).pushReplacement(
           PageRouteBuilder(
@@ -63,7 +63,7 @@ class _SplashScreenState extends State<SplashScreen>
                 child: child,
               );
             },
-            transitionDuration: const Duration(milliseconds: 800),
+            transitionDuration: const Duration(milliseconds: 600),
           ),
         );
       }
@@ -84,19 +84,7 @@ class _SplashScreenState extends State<SplashScreen>
     return Scaffold(
       body: Container(
         decoration: BoxDecoration(
-          gradient: LinearGradient(
-            colors: isDark
-                ? [
-                    const Color(0xFF0F172A), // Slate 900
-                    const Color(0xFF1E1B4B), // Indigo 950
-                  ]
-                : [
-                    const Color(0xFFF8FAFC), // Slate 50
-                    const Color(0xFFEEF2F6), // Cool gray
-                  ],
-            begin: Alignment.topLeft,
-            end: Alignment.bottomRight,
-          ),
+          color: isDark ? const Color(0xFF090D16) : const Color(0xFFF8FAFC),
         ),
         child: AnimatedBuilder(
           animation: _animationController,
@@ -115,32 +103,32 @@ class _SplashScreenState extends State<SplashScreen>
               children: [
                 // Glowing circular brand icon
                 Container(
-                  padding: const EdgeInsets.all(24),
+                  padding: const EdgeInsets.all(22),
                   decoration: BoxDecoration(
-                    color: theme.colorScheme.primary.withOpacity(0.08),
+                    color: theme.colorScheme.primary.withValues(alpha: 0.08),
                     shape: BoxShape.circle,
                     boxShadow: [
                       BoxShadow(
-                        color: theme.colorScheme.primary.withOpacity(0.12),
-                        blurRadius: 40,
-                        spreadRadius: 10,
+                        color: theme.colorScheme.primary.withValues(alpha: 0.15),
+                        blurRadius: 36,
+                        spreadRadius: 6,
                       )
                     ],
                     border: Border.all(
-                      color: theme.colorScheme.primary.withOpacity(0.2),
+                      color: theme.colorScheme.primary.withValues(alpha: 0.2),
                       width: 1.5,
                     ),
                   ),
                   child: Image.asset(
                     'assets/images/Icon.png',
-                    width: 50,
-                    height: 50,
+                    width: 52,
+                    height: 52,
                     fit: BoxFit.cover,
                     errorBuilder: (context, error, stackTrace) {
                       return Icon(
-                        Icons.psychology,
+                        Icons.psychology_rounded,
                         color: theme.colorScheme.primary,
-                        size: 80,
+                        size: 52,
                       );
                     },
                   ),
@@ -148,42 +136,67 @@ class _SplashScreenState extends State<SplashScreen>
                 const SizedBox(height: 24),
                 // Premium branding title
                 Text(
-                  'LOCALMIND',
+                  'LocalMind',
                   style: GoogleFonts.spaceGrotesk(
-                    fontSize: 28,
+                    fontSize: 30,
                     fontWeight: FontWeight.bold,
-                    letterSpacing: 2.0,
+                    letterSpacing: 1.5,
                     color: theme.colorScheme.onSurface,
                   ),
                 ),
-                const SizedBox(height: 8),
+                const SizedBox(height: 6),
                 // Subtitle
                 Text(
-                  'High-Performance Offline AI',
+                  'Your private AI. Running on your device.',
                   style: GoogleFonts.inter(
-                    fontSize: 14,
+                    fontSize: 12.5,
                     fontWeight: FontWeight.w500,
-                    color: theme.colorScheme.onSurface.withOpacity(0.5),
+                    color: theme.colorScheme.onSurface.withValues(alpha: 0.6),
                   ),
                 ),
-                const SizedBox(height: 80),
+                const SizedBox(height: 12),
+                // Offline privacy badge
+                Container(
+                  padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
+                  decoration: BoxDecoration(
+                    color: const Color(0xFF10B981).withValues(alpha: 0.12),
+                    borderRadius: BorderRadius.circular(20),
+                    border: Border.all(color: const Color(0xFF10B981).withValues(alpha: 0.3)),
+                  ),
+                  child: Row(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      const Icon(Icons.shield_outlined, size: 12, color: Color(0xFF10B981)),
+                      const SizedBox(width: 5),
+                      Text(
+                        '100% Offline & Private',
+                        style: GoogleFonts.jetBrainsMono(
+                          fontSize: 10,
+                          fontWeight: FontWeight.bold,
+                          color: const Color(0xFF10B981),
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+                const SizedBox(height: 70),
                 // Loading spinner and status text
                 SizedBox(
-                  width: 24,
-                  height: 24,
+                  width: 22,
+                  height: 22,
                   child: CircularProgressIndicator(
-                    strokeWidth: 2.5,
+                    strokeWidth: 2.2,
                     valueColor: AlwaysStoppedAnimation<Color>(
                       theme.colorScheme.primary,
                     ),
                   ),
                 ),
-                const SizedBox(height: 16),
+                const SizedBox(height: 14),
                 Text(
-                  'Initializing Neural Core...',
+                  'Initializing local engine...',
                   style: GoogleFonts.jetBrainsMono(
                     fontSize: 11,
-                    color: theme.colorScheme.primary.withOpacity(0.7),
+                    color: theme.colorScheme.primary.withValues(alpha: 0.7),
                   ),
                 ),
               ],

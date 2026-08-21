@@ -6,6 +6,8 @@ import 'package:image_picker/image_picker.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import '../models/ai_model.dart';
 import '../services/device_info_helper.dart';
+import '../widgets/app_feedback_service.dart';
+import 'diagnostics_screen.dart';
 
 class SettingsScreen extends StatefulWidget {
   final List<AIModel> installedModels;
@@ -29,10 +31,10 @@ class _SettingsScreenState extends State<SettingsScreen> {
   final bool _quantization = true;
   final bool _gpuAcceleration = true;
 
-  double _totalStorageGB = 512.0;
-  double _freeStorageGB = 200.0;
-  double _totalRamGB = 16.0;
-  double _usedRamGB = 8.0;
+  double _totalStorageGB = 0.0;
+  double _freeStorageGB = 0.0;
+  double _totalRamGB = 0.0;
+  double _usedRamGB = 0.0;
 
   bool _isEditing = false;
   String _savedName = 'User';
@@ -50,7 +52,8 @@ class _SettingsScreenState extends State<SettingsScreen> {
   String? _selectedImagePath;
 
   String _getInitials(String fullName) {
-    final names = fullName.trim().split(' ').where((s) => s.isNotEmpty).toList();
+    final names =
+        fullName.trim().split(' ').where((s) => s.isNotEmpty).toList();
     if (names.isEmpty) return 'U';
     if (names.length == 1) return names[0][0].toUpperCase();
     return (names.first[0] + names.last[0]).toUpperCase();
@@ -81,12 +84,8 @@ class _SettingsScreenState extends State<SettingsScreen> {
       }
     } catch (e) {
       debugPrint('Error picking image: $e');
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(
-          content: Text('Failed to pick image: $e'),
-          backgroundColor: Colors.redAccent,
-        ),
-      );
+      if (!mounted) return;
+      AppFeedbackService.showToast(context, 'Failed to pick image: $e', isError: true);
     }
   }
 
@@ -104,14 +103,15 @@ class _SettingsScreenState extends State<SettingsScreen> {
             ),
             border: Border(
               top: BorderSide(
-                color: theme.colorScheme.outline.withOpacity(0.15),
+                color: theme.colorScheme.outline.withValues(alpha: 0.15),
                 width: 1,
               ),
             ),
           ),
           child: SafeArea(
             child: Padding(
-              padding: const EdgeInsets.symmetric(vertical: 20.0, horizontal: 16.0),
+              padding:
+                  const EdgeInsets.symmetric(vertical: 20.0, horizontal: 16.0),
               child: Column(
                 mainAxisSize: MainAxisSize.min,
                 children: [
@@ -170,7 +170,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
         padding: const EdgeInsets.symmetric(vertical: 16),
         decoration: BoxDecoration(
           border: Border.all(
-            color: theme.colorScheme.outline.withOpacity(0.12),
+            color: theme.colorScheme.outline.withValues(alpha: 0.12),
           ),
           borderRadius: BorderRadius.circular(12),
         ),
@@ -205,7 +205,8 @@ class _SettingsScreenState extends State<SettingsScreen> {
       setState(() {
         _savedName = prefs.getString('profile_name') ?? 'User';
         _savedUsername = prefs.getString('profile_username') ?? '@user_dev';
-        _savedContact = prefs.getString('profile_contact') ?? 'user@example.com';
+        _savedContact =
+            prefs.getString('profile_contact') ?? 'user@example.com';
         _savedAvatarColorIndex = prefs.getInt('profile_color_index') ?? 0;
         _savedImageDeleted = prefs.getBool('profile_image_deleted') ?? false;
         _savedImagePath = prefs.getString('profile_image_path');
@@ -277,73 +278,18 @@ class _SettingsScreenState extends State<SettingsScreen> {
     super.dispose();
   }
 
-  void _showDeleteModelConfirmation(String modelId, String modelName, ThemeData theme) {
-    showGeneralDialog(
-      context: context,
-      barrierDismissible: true,
-      barrierLabel: '',
-      barrierColor: Colors.black.withOpacity(0.5),
-      transitionDuration: const Duration(milliseconds: 220),
-      pageBuilder: (ctx, anim1, anim2) => const SizedBox.shrink(),
-      transitionBuilder: (ctx, anim1, anim2, child) {
-        final curve = Curves.easeOutBack.transform(anim1.value);
-        return Transform.scale(
-          scale: 0.9 + 0.1 * curve,
-          child: Opacity(
-            opacity: anim1.value,
-            child: AlertDialog(
-              backgroundColor: theme.colorScheme.surface,
-              elevation: 20,
-              shape: RoundedRectangleBorder(
-                  borderRadius: BorderRadius.circular(16)),
-              title: Row(
-                children: [
-                  const Icon(Icons.delete_outline_rounded,
-                      color: Colors.redAccent),
-                  const SizedBox(width: 8),
-                  Expanded(
-                    child: Text(
-                      'Delete Model?',
-                      style:
-                          GoogleFonts.spaceGrotesk(fontWeight: FontWeight.bold),
-                    ),
-                  ),
-                ],
-              ),
-              content: Text(
-                'Are you sure you want to delete "$modelName"? This will remove the model files from your device storage.',
-                style: GoogleFonts.inter(
-                    fontSize: 13,
-                    color: theme.colorScheme.onSurface.withOpacity(0.7)),
-              ),
-              actions: [
-                TextButton(
-                  onPressed: () => Navigator.of(ctx).pop(),
-                  child: Text(
-                    'Cancel',
-                    style: TextStyle(
-                        color: theme.colorScheme.onSurface.withOpacity(0.6),
-                        fontWeight: FontWeight.bold),
-                  ),
-                ),
-                TextButton(
-                  onPressed: () {
-                    Navigator.of(ctx).pop();
-                    widget.onDeleteModel(modelId);
-                  },
-                  child: const Text(
-                    'Delete',
-                    style: TextStyle(
-                        color: Colors.redAccent,
-                        fontWeight: FontWeight.bold),
-                  ),
-                ),
-              ],
-            ),
-          ),
-        );
-      },
+  Future<void> _showDeleteModelConfirmation(
+      String modelId, String modelName, ThemeData theme) async {
+    final modelObj = widget.installedModels.firstWhere((m) => m.id == modelId, orElse: () => widget.installedModels.first);
+    final sizeGB = modelObj.fileSizeBytes / (1024.0 * 1024.0 * 1024.0);
+    final confirmed = await AppFeedbackService.showDeleteConfirmation(
+      context,
+      modelName: modelName,
+      fileSizeGB: sizeGB,
     );
+    if (confirmed) {
+      widget.onDeleteModel(modelId);
+    }
   }
 
   @override
@@ -355,7 +301,8 @@ class _SettingsScreenState extends State<SettingsScreen> {
       final val = double.tryParse(m.size.split(' ').first) ?? 0.0;
       return sum + val;
     });
-    final double totalStorageUsed = (_totalStorageGB - _freeStorageGB) + installedSum;
+    final double totalStorageUsed =
+        (_totalStorageGB - _freeStorageGB) + installedSum;
     final double storagePercent = _totalStorageGB > 0
         ? (totalStorageUsed / _totalStorageGB).clamp(0.0, 1.0)
         : 0.0;
@@ -366,9 +313,8 @@ class _SettingsScreenState extends State<SettingsScreen> {
       finalRamUsed += _quantization ? 1.5 : 3.0;
     }
     finalRamUsed = finalRamUsed.clamp(0.0, _totalRamGB);
-    final double ramPercent = _totalRamGB > 0
-        ? (finalRamUsed / _totalRamGB).clamp(0.0, 1.0)
-        : 0.0;
+    final double ramPercent =
+        _totalRamGB > 0 ? (finalRamUsed / _totalRamGB).clamp(0.0, 1.0) : 0.0;
 
     return Center(
       child: Container(
@@ -384,7 +330,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
                     decoration: BoxDecoration(
                       color: theme.colorScheme.surface,
                       border: Border.all(
-                          color: theme.colorScheme.outline.withOpacity(0.15)),
+                          color: theme.colorScheme.outline.withValues(alpha: 0.15)),
                       borderRadius: BorderRadius.circular(16),
                     ),
                     child: Column(
@@ -399,7 +345,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
                           ),
                         ),
                         const SizedBox(height: 16),
-                        
+
                         // Centered Profile Image & Three Dots Menu
                         Center(
                           child: SizedBox(
@@ -423,7 +369,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
                                           ),
                                     color: _selectedImageDeleted
                                         ? theme.colorScheme.outline
-                                            .withOpacity(0.15)
+                                            .withValues(alpha: 0.15)
                                         : null,
                                     shape: BoxShape.circle,
                                     image: (_selectedImagePath != null &&
@@ -439,7 +385,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
                                         BoxShadow(
                                           color: _avatarGradients[
                                                   _selectedAvatarColorIndex][0]
-                                              .withOpacity(0.25),
+                                              .withValues(alpha: 0.25),
                                           blurRadius: 8,
                                           spreadRadius: 2,
                                         )
@@ -456,7 +402,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
                                               fontWeight: FontWeight.bold,
                                               color: _selectedImageDeleted
                                                   ? theme.colorScheme.onSurface
-                                                      .withOpacity(0.4)
+                                                      .withValues(alpha: 0.4)
                                                   : Colors.black,
                                             ),
                                           ),
@@ -474,12 +420,12 @@ class _SettingsScreenState extends State<SettingsScreen> {
                                       shape: BoxShape.circle,
                                       border: Border.all(
                                         color: theme.colorScheme.outline
-                                            .withOpacity(0.15),
+                                            .withValues(alpha: 0.15),
                                         width: 1,
                                       ),
                                       boxShadow: [
                                         BoxShadow(
-                                          color: Colors.black.withOpacity(0.1),
+                                          color: Colors.black.withValues(alpha: 0.1),
                                           blurRadius: 4,
                                           offset: const Offset(0, 2),
                                         ),
@@ -514,23 +460,24 @@ class _SettingsScreenState extends State<SettingsScreen> {
                                             children: [
                                               Icon(Icons.image_outlined,
                                                   size: 16,
-                                                  color: theme.colorScheme.onSurface),
+                                                  color: theme
+                                                      .colorScheme.onSurface),
                                               const SizedBox(width: 8),
                                               const Text('Change Image',
-                                                  style: TextStyle(fontSize: 13)),
+                                                  style:
+                                                      TextStyle(fontSize: 13)),
                                             ],
                                           ),
                                         ),
-                                        PopupMenuItem(
+                                        const PopupMenuItem(
                                           value: 'delete',
                                           child: Row(
                                             children: [
-                                              const Icon(
-                                                  Icons.delete_outline_rounded,
+                                              Icon(Icons.delete_outline_rounded,
                                                   size: 16,
                                                   color: Colors.redAccent),
-                                              const SizedBox(width: 8),
-                                              const Text('Delete Image',
+                                              SizedBox(width: 8),
+                                              Text('Delete Image',
                                                   style: TextStyle(
                                                       fontSize: 13,
                                                       color: Colors.redAccent)),
@@ -553,16 +500,16 @@ class _SettingsScreenState extends State<SettingsScreen> {
                             labelText: 'Full Name',
                             labelStyle: TextStyle(
                                 color: theme.colorScheme.onSurface
-                                    .withOpacity(0.6),
+                                    .withValues(alpha: 0.6),
                                 fontSize: 13),
                             enabledBorder: UnderlineInputBorder(
                               borderSide: BorderSide(
                                   color: theme.colorScheme.outline
-                                      .withOpacity(0.3)),
+                                      .withValues(alpha: 0.3)),
                             ),
                             focusedBorder: UnderlineInputBorder(
-                              borderSide: BorderSide(
-                                  color: theme.colorScheme.primary),
+                              borderSide:
+                                  BorderSide(color: theme.colorScheme.primary),
                             ),
                           ),
                           style: TextStyle(
@@ -579,16 +526,16 @@ class _SettingsScreenState extends State<SettingsScreen> {
                             labelText: 'Username',
                             labelStyle: TextStyle(
                                 color: theme.colorScheme.onSurface
-                                    .withOpacity(0.6),
+                                    .withValues(alpha: 0.6),
                                 fontSize: 13),
                             enabledBorder: UnderlineInputBorder(
                               borderSide: BorderSide(
                                   color: theme.colorScheme.outline
-                                      .withOpacity(0.3)),
+                                      .withValues(alpha: 0.3)),
                             ),
                             focusedBorder: UnderlineInputBorder(
-                              borderSide: BorderSide(
-                                  color: theme.colorScheme.primary),
+                              borderSide:
+                                  BorderSide(color: theme.colorScheme.primary),
                             ),
                           ),
                           style: TextStyle(
@@ -601,16 +548,16 @@ class _SettingsScreenState extends State<SettingsScreen> {
                             labelText: 'Email / Mobile Number',
                             labelStyle: TextStyle(
                                 color: theme.colorScheme.onSurface
-                                    .withOpacity(0.6),
+                                    .withValues(alpha: 0.6),
                                 fontSize: 13),
                             enabledBorder: UnderlineInputBorder(
                               borderSide: BorderSide(
                                   color: theme.colorScheme.outline
-                                      .withOpacity(0.3)),
+                                      .withValues(alpha: 0.3)),
                             ),
                             focusedBorder: UnderlineInputBorder(
-                              borderSide: BorderSide(
-                                  color: theme.colorScheme.primary),
+                              borderSide:
+                                  BorderSide(color: theme.colorScheme.primary),
                             ),
                           ),
                           style: TextStyle(
@@ -634,7 +581,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
                                 'Discard',
                                 style: TextStyle(
                                   color: theme.colorScheme.onSurface
-                                      .withOpacity(0.6),
+                                      .withValues(alpha: 0.6),
                                   fontWeight: FontWeight.bold,
                                 ),
                               ),
@@ -646,7 +593,8 @@ class _SettingsScreenState extends State<SettingsScreen> {
                                   _savedName = _nameController.text.trim();
                                   _savedUsername =
                                       _usernameController.text.trim();
-                                  _savedContact = _contactController.text.trim();
+                                  _savedContact =
+                                      _contactController.text.trim();
                                   _savedAvatarColorIndex =
                                       _selectedAvatarColorIndex;
                                   _savedImageDeleted = _selectedImageDeleted;
@@ -675,7 +623,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
                     decoration: BoxDecoration(
                       color: theme.colorScheme.surface,
                       border: Border.all(
-                          color: theme.colorScheme.outline.withOpacity(0.12)),
+                          color: theme.colorScheme.outline.withValues(alpha: 0.12)),
                       borderRadius: BorderRadius.circular(16),
                     ),
                     child: Row(
@@ -687,15 +635,17 @@ class _SettingsScreenState extends State<SettingsScreen> {
                             gradient: _savedImageDeleted
                                 ? null
                                 : LinearGradient(
-                                    colors: _avatarGradients[_savedAvatarColorIndex],
+                                    colors: _avatarGradients[
+                                        _savedAvatarColorIndex],
                                     begin: Alignment.topLeft,
                                     end: Alignment.bottomRight,
                                   ),
                             color: _savedImageDeleted
-                                ? theme.colorScheme.outline.withOpacity(0.15)
+                                ? theme.colorScheme.outline.withValues(alpha: 0.15)
                                 : null,
                             shape: BoxShape.circle,
-                            image: (_savedImagePath != null && !_savedImageDeleted)
+                            image: (_savedImagePath != null &&
+                                    !_savedImageDeleted)
                                 ? DecorationImage(
                                     image: _getProfileImage(_savedImagePath!),
                                     fit: BoxFit.cover,
@@ -704,29 +654,31 @@ class _SettingsScreenState extends State<SettingsScreen> {
                             boxShadow: [
                               if (!_savedImageDeleted)
                                 BoxShadow(
-                                  color: _avatarGradients[_savedAvatarColorIndex]
-                                          [0]
-                                      .withOpacity(0.25),
+                                  color:
+                                      _avatarGradients[_savedAvatarColorIndex]
+                                              [0]
+                                          .withValues(alpha: 0.25),
                                   blurRadius: 8,
                                   spreadRadius: 2,
                                 )
                             ],
                           ),
-                          child: (_savedImagePath != null && !_savedImageDeleted)
-                              ? null
-                              : Center(
-                                  child: Text(
-                                    _getInitials(_savedName),
-                                    style: TextStyle(
-                                      fontSize: 16,
-                                      fontWeight: FontWeight.bold,
-                                      color: _savedImageDeleted
-                                          ? theme.colorScheme.onSurface
-                                              .withOpacity(0.4)
-                                          : Colors.black,
+                          child:
+                              (_savedImagePath != null && !_savedImageDeleted)
+                                  ? null
+                                  : Center(
+                                      child: Text(
+                                        _getInitials(_savedName),
+                                        style: TextStyle(
+                                          fontSize: 16,
+                                          fontWeight: FontWeight.bold,
+                                          color: _savedImageDeleted
+                                              ? theme.colorScheme.onSurface
+                                                  .withValues(alpha: 0.4)
+                                              : Colors.black,
+                                        ),
+                                      ),
                                     ),
-                                  ),
-                                ),
                         ),
                         const SizedBox(width: 16),
                         Expanded(
@@ -747,7 +699,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
                                 style: GoogleFonts.inter(
                                   fontSize: 12,
                                   color: theme.colorScheme.onSurface
-                                      .withOpacity(0.5),
+                                      .withValues(alpha: 0.5),
                                 ),
                               ),
                             ],
@@ -781,7 +733,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
               decoration: BoxDecoration(
                 color: theme.colorScheme.surface,
                 border: Border.all(
-                    color: theme.colorScheme.outline.withOpacity(0.12)),
+                    color: theme.colorScheme.outline.withValues(alpha: 0.12)),
                 borderRadius: BorderRadius.circular(16),
               ),
               child: Row(
@@ -790,7 +742,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
                     width: 38,
                     height: 38,
                     decoration: BoxDecoration(
-                      color: theme.colorScheme.primary.withOpacity(0.06),
+                      color: theme.colorScheme.primary.withValues(alpha: 0.06),
                       borderRadius: BorderRadius.circular(10),
                     ),
                     child: Icon(
@@ -819,7 +771,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
                           widget.isDarkMode ? 'Dark Mode' : 'Light Mode',
                           style: GoogleFonts.inter(
                             fontSize: 11,
-                            color: theme.colorScheme.onSurface.withOpacity(0.5),
+                            color: theme.colorScheme.onSurface.withValues(alpha: 0.5),
                           ),
                         ),
                       ],
@@ -828,7 +780,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
                   const SizedBox(width: 10),
                   Switch(
                     value: widget.isDarkMode,
-                    activeColor: theme.colorScheme.secondary,
+                    activeThumbColor: theme.colorScheme.secondary,
                     onChanged: (val) => widget.onThemeChanged(val),
                   ),
                 ],
@@ -836,9 +788,78 @@ class _SettingsScreenState extends State<SettingsScreen> {
             ),
             const SizedBox(height: 16),
 
+            // Engine Diagnostics Card
+            InkWell(
+              onTap: () {
+                Navigator.of(context).push(
+                  MaterialPageRoute(
+                    builder: (context) => const DiagnosticsScreen(),
+                  ),
+                );
+              },
+              borderRadius: BorderRadius.circular(16),
+              child: Container(
+                padding: const EdgeInsets.all(14),
+                decoration: BoxDecoration(
+                  color: theme.colorScheme.surface,
+                  border: Border.all(
+                      color: theme.colorScheme.outline.withValues(alpha: 0.12)),
+                  borderRadius: BorderRadius.circular(16),
+                ),
+                child: Row(
+                  children: [
+                    Container(
+                      width: 38,
+                      height: 38,
+                      decoration: BoxDecoration(
+                        color: theme.colorScheme.primary.withValues(alpha: 0.06),
+                        borderRadius: BorderRadius.circular(10),
+                      ),
+                      child: Icon(
+                        Icons.developer_board_outlined,
+                        color: theme.colorScheme.primary,
+                        size: 20,
+                      ),
+                    ),
+                    const SizedBox(width: 14),
+                    Expanded(
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          Text(
+                            'Engine Diagnostics',
+                            style: GoogleFonts.inter(
+                              fontSize: 13.5,
+                              fontWeight: FontWeight.bold,
+                              color: theme.colorScheme.onSurface,
+                            ),
+                          ),
+                          const SizedBox(height: 2),
+                          Text(
+                            'View llama.cpp metrics, t/s, nCtx & debug state',
+                            style: GoogleFonts.inter(
+                              fontSize: 11,
+                              color: theme.colorScheme.onSurface.withValues(alpha: 0.5),
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
+                    Icon(
+                      Icons.chevron_right_rounded,
+                      color: theme.colorScheme.onSurface.withValues(alpha: 0.4),
+                    ),
+                  ],
+                ),
+              ),
+            ),
+            const SizedBox(height: 16),
+
             // Resource Gauges
             _buildGaugeCard(
-              title: kIsWeb ? 'Storage Capacity (Web Sandbox)' : 'Storage Capacity',
+              title: kIsWeb
+                  ? 'Storage Capacity (Web Sandbox)'
+                  : 'Storage Capacity',
               subtitle: kIsWeb
                   ? '${totalStorageUsed.toStringAsFixed(1)} GB Used of ${_totalStorageGB.toStringAsFixed(0)} GB Browser Quota'
                   : '${totalStorageUsed.toStringAsFixed(1)} GB Used of ${_totalStorageGB.toStringAsFixed(0)} GB Available',
@@ -883,8 +904,9 @@ class _SettingsScreenState extends State<SettingsScreen> {
                     name: m.name,
                     quantization: m.quantization,
                     description: m.description,
-                    meta: '${m.size} • Local Cache Verified',
-                    onDelete: () => _showDeleteModelConfirmation(m.id, m.name, theme),
+                    meta: '${m.size} • Verified',
+                    onDelete: () =>
+                        _showDeleteModelConfirmation(m.id, m.name, theme),
                     theme: theme,
                   ),
                 )),
@@ -907,7 +929,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
       padding: const EdgeInsets.all(16),
       decoration: BoxDecoration(
         color: theme.colorScheme.surface,
-        border: Border.all(color: theme.colorScheme.outline.withOpacity(0.12)),
+        border: Border.all(color: theme.colorScheme.outline.withValues(alpha: 0.12)),
         borderRadius: BorderRadius.circular(16),
       ),
       child: Column(
@@ -949,7 +971,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
             subtitle,
             style: GoogleFonts.inter(
                 fontSize: 11,
-                color: theme.colorScheme.onSurface.withOpacity(0.5)),
+                color: theme.colorScheme.onSurface.withValues(alpha: 0.5)),
           ),
           const SizedBox(height: 10),
           ClipRRect(
@@ -957,7 +979,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
             child: LinearProgressIndicator(
               value: percent,
               minHeight: 5,
-              backgroundColor: theme.colorScheme.outline.withOpacity(0.1),
+              backgroundColor: theme.colorScheme.outline.withValues(alpha: 0.1),
               valueColor:
                   AlwaysStoppedAnimation<Color>(theme.colorScheme.secondary),
             ),
@@ -990,7 +1012,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
       padding: const EdgeInsets.all(14),
       decoration: BoxDecoration(
         color: theme.colorScheme.surface,
-        border: Border.all(color: theme.colorScheme.outline.withOpacity(0.12)),
+        border: Border.all(color: theme.colorScheme.outline.withValues(alpha: 0.12)),
         borderRadius: BorderRadius.circular(16),
       ),
       child: Row(
@@ -1000,9 +1022,9 @@ class _SettingsScreenState extends State<SettingsScreen> {
             width: 40,
             height: 40,
             decoration: BoxDecoration(
-              color: theme.colorScheme.primary.withOpacity(0.06),
+              color: theme.colorScheme.primary.withValues(alpha: 0.06),
               border: Border.all(
-                  color: theme.colorScheme.primary.withOpacity(0.15)),
+                  color: theme.colorScheme.primary.withValues(alpha: 0.15)),
               borderRadius: BorderRadius.circular(10),
             ),
             child: Icon(Icons.auto_awesome_rounded,
@@ -1031,10 +1053,10 @@ class _SettingsScreenState extends State<SettingsScreen> {
                       padding: const EdgeInsets.symmetric(
                           horizontal: 6, vertical: 2),
                       decoration: BoxDecoration(
-                        color: theme.colorScheme.secondary.withOpacity(0.08),
+                        color: theme.colorScheme.secondary.withValues(alpha: 0.08),
                         border: Border.all(
                             color:
-                                theme.colorScheme.secondary.withOpacity(0.15)),
+                                theme.colorScheme.secondary.withValues(alpha: 0.15)),
                         borderRadius: BorderRadius.circular(4),
                       ),
                       child: Text(
@@ -1050,8 +1072,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
                       InkWell(
                         onTap: onDelete,
                         child: Icon(Icons.delete_outline_rounded,
-                            color:
-                                theme.colorScheme.onSurface.withOpacity(0.4),
+                            color: theme.colorScheme.onSurface.withValues(alpha: 0.4),
                             size: 18),
                       ),
                     ],
@@ -1062,7 +1083,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
                   description,
                   style: GoogleFonts.inter(
                       fontSize: 11.5,
-                      color: theme.colorScheme.onSurface.withOpacity(0.6),
+                      color: theme.colorScheme.onSurface.withValues(alpha: 0.6),
                       height: 1.35),
                 ),
                 const SizedBox(height: 8),
@@ -1071,7 +1092,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
                   style: GoogleFonts.jetBrainsMono(
                       fontSize: 9.5,
                       fontWeight: FontWeight.bold,
-                      color: theme.colorScheme.onSurface.withOpacity(0.4)),
+                      color: theme.colorScheme.onSurface.withValues(alpha: 0.4)),
                 ),
               ],
             ),

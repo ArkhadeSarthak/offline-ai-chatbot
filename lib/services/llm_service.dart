@@ -1,154 +1,173 @@
+import 'dart:async';
 import 'package:flutter/foundation.dart';
-import 'package:dio/dio.dart';
-import 'network_helper.dart';
 import 'local_llm_handler.dart';
+import 'local_llm_helper.dart';
+import 'prompt_builder.dart';
+import 'model_chat_template_service.dart';
+import 'settings_service.dart';
 
 class LLMService {
   String? _loadedModelPath;
-  final Dio _dio = Dio();
+  String _activeModelName = "Offline AI";
+  String _activeChatTemplate = "chatml";
+  InferenceSettings _settings = InferenceSettings();
 
-  Future<void> loadModel(String modelPath) async {
+  void updateSettings(InferenceSettings settings) {
+    _settings = settings;
+  }
+
+  Future<void> loadModel(
+    String modelPath, {
+    String? modelName,
+    String? chatTemplate,
+    InferenceSettings? settings,
+  }) async {
     if (modelPath.isEmpty) {
       throw Exception("Model path is empty.");
     }
+    if (settings != null) {
+      _settings = settings;
+    }
+
     _loadedModelPath = modelPath;
-    debugPrint("[LocalMind] Loading model at path: $modelPath");
+    if (modelName != null) {
+      _activeModelName = modelName;
+    } else {
+      _activeModelName = _getModelFriendlyName();
+    }
+
+    _activeChatTemplate = ModelChatTemplateService.resolveTemplate(
+      chatTemplate ?? '',
+      modelId: modelName,
+      fileName: modelPath,
+    );
+
+    debugPrint("[LLM] Loading model at: $modelPath (template=$_activeChatTemplate)");
     try {
-      await LocalLLMHandler.loadModel(modelPath);
-      debugPrint("[LocalMind] Successfully loaded model at path: $modelPath");
+      await LocalLLMHandler.loadModel(modelPath, settings: _settings);
+      debugPrint("[LLM] MODEL_LOADED=true path=$modelPath");
     } catch (e) {
-      debugPrint("[LocalMind] [ERROR] Failed to load model at $modelPath: $e");
+      debugPrint("[LLM] [ERROR] Failed to load model: $e");
       _loadedModelPath = null;
       rethrow;
     }
   }
 
-  Future<String> generateResponse(String prompt) async {
+  /// Pure offline streaming token generation with model-aware prompt formatting and multi-chunk stop token cleaning.
+  Stream<String> generateStream(
+    String userMessage, {
+    String? chatTemplate,
+    List<ChatMessageItem>? history,
+    InferenceSettings? settings,
+  }) async* {
     if (_loadedModelPath == null) {
-      throw Exception("No model is currently loaded. Load a model first.");
+      throw Exception("No model is currently loaded. Please select and install a model first.");
     }
 
-    final modelName = _getModelFriendlyName();
-    final hfModelId = _getHuggingFaceModelId();
+    final activeSettings = settings ?? _settings;
+    final modelName = _activeModelName;
+    final template = ModelChatTemplateService.resolveTemplate(
+      chatTemplate ?? _activeChatTemplate,
+      modelId: modelName,
+      fileName: _loadedModelPath,
+    );
 
-    // 1. Try Local GGUF Model Response first (primary offline model)
-    try {
-      final localResponse = await LocalLLMHandler.generateResponse(prompt, modelName, _loadedModelPath!);
-      if (localResponse.isNotEmpty && !localResponse.startsWith("Error running model inference")) {
-        return localResponse;
-      }
-      debugPrint("[LocalMind] Local inference returned empty or error response. Attempting online fallback...");
-    } catch (e) {
-      debugPrint("[LocalMind] Local inference failed: $e. Attempting online fallback...");
-    }
+    final formattedPrompt = PromptBuilder.buildPrompt(
+      userMessage: userMessage,
+      chatTemplate: template,
+      history: history,
+      maxContextChars: activeSettings.contextLength * 3,
+    );
 
-    // 2. Online Fallback APIs (if online and local inference failed)
-    final isOnline = await NetworkHelper.hasInternetConnection();
+    debugPrint("[LLM] ACTIVE_MODEL=$modelName");
+    debugPrint("[LLM] CHAT_TEMPLATE=$template");
+    debugPrint("[LLM] PROMPT_CREATED length=${formattedPrompt.length}");
 
-    if (isOnline) {
-      // A. Try Hugging Face Serverless API (with shorter timeouts to fail fast)
-      try {
-        final response = await _dio.post(
-          "https://api-inference.huggingface.co/models/$hfModelId",
-          data: {
-            "inputs": prompt,
-            "parameters": {
-              "max_new_tokens": 300,
-              "return_full_text": false,
-            }
-          },
-          options: Options(
-            headers: {
-              "Content-Type": "application/json",
-            },
-            sendTimeout: const Duration(seconds: 4),
-            receiveTimeout: const Duration(seconds: 4),
-          ),
-        );
+    final stopTokens = PromptBuilder.getStopTokensForTemplate(template);
+    final cleaner = StreamStopTokenCleaner(stopTokens);
 
-        if (response.statusCode == 200) {
-          final data = response.data;
-          if (data is List && data.isNotEmpty) {
-            final genText = data[0]['generated_text'];
-            if (genText != null && genText.toString().trim().isNotEmpty) {
-              return genText.toString().trim();
-            }
-          } else if (data is Map && data.containsKey('generated_text')) {
-            final genText = data['generated_text'];
-            if (genText != null && genText.toString().trim().isNotEmpty) {
-              return genText.toString().trim();
-            }
-          }
-        }
-      } catch (e) {
-        debugPrint("[LocalMind] HF Inference API failed for $hfModelId: $e. Trying fallback API...");
-      }
-
-      // B. Try Pollinations AI (with shorter timeouts to fail fast)
-      try {
-        final response = await _dio.post(
-          "https://text.pollinations.ai/",
-          data: {
-            "messages": [
-              {
-                "role": "system",
-                "content": "You are the selected AI model: $modelName. Answer the user's question as this model. Be helpful, concise, and respond in character."
-              },
-              {"role": "user", "content": prompt}
-            ],
-            "model": "openai",
-            "jsonMode": false,
-          },
-          options: Options(
-            responseType: ResponseType.plain,
-            sendTimeout: const Duration(seconds: 5),
-            receiveTimeout: const Duration(seconds: 5),
-          ),
-        );
-
-        if (response.statusCode == 200 && response.data != null) {
-          final resText = response.data.toString().trim();
-          if (resText.isNotEmpty) {
-            return resText;
-          }
-        }
-      } catch (e) {
-        debugPrint("[LocalMind] Pollinations AI API failed: $e.");
+    await for (final rawChunk in LocalLLMHandler.generateStream(
+      formattedPrompt,
+      modelName,
+      _loadedModelPath!,
+      settings: activeSettings,
+    )) {
+      final cleanedChunk = cleaner.processChunk(rawChunk);
+      if (cleanedChunk.isNotEmpty) {
+        yield cleanedChunk;
       }
     }
 
-    return "Error: Could not generate response locally or online. Please check your model or internet connection.";
+    final trailing = cleaner.flush();
+    if (trailing.isNotEmpty) {
+      yield trailing;
+    }
+  }
+
+  /// Pure offline single-response generation with model-aware prompt formatting.
+  Future<String> generateResponse(
+    String userMessage, {
+    String? chatTemplate,
+    List<ChatMessageItem>? history,
+    InferenceSettings? settings,
+  }) async {
+    if (_loadedModelPath == null) {
+      throw Exception("No model is currently loaded. Please select and install a model first.");
+    }
+
+    final activeSettings = settings ?? _settings;
+    final modelName = _activeModelName;
+    final template = ModelChatTemplateService.resolveTemplate(
+      chatTemplate ?? _activeChatTemplate,
+      modelId: modelName,
+      fileName: _loadedModelPath,
+    );
+
+    final formattedPrompt = PromptBuilder.buildPrompt(
+      userMessage: userMessage,
+      chatTemplate: template,
+      history: history,
+      maxContextChars: activeSettings.contextLength * 3,
+    );
+
+    final rawResponse = await LocalLLMHandler.generateResponse(
+      formattedPrompt,
+      modelName,
+      _loadedModelPath!,
+      settings: activeSettings,
+    );
+    return PromptBuilder.cleanStopTokens(rawResponse, templateName: template);
+  }
+
+  void stopGeneration() {
+    LocalLLMHandler.stopGeneration();
   }
 
   Future<void> unloadModel() async {
     _loadedModelPath = null;
     await LocalLLMHandler.unloadModel();
-    debugPrint("[LocalMind] Model unloaded in LLMService.");
+    debugPrint("[LLM] MODEL_UNLOADED=true in LLMService.");
   }
 
   bool get isModelLoaded => _loadedModelPath != null && LocalLLMHandler.isModelLoaded;
+  String? get loadedModelPath => _loadedModelPath;
+  String get activeModelName => _activeModelName;
+  String get activeChatTemplate => _activeChatTemplate;
+  InferenceSettings get currentSettings => _settings;
 
-  String _getModelFriendlyName() {
-    if (_loadedModelPath == null) return "AI Assistant";
-    final pathLower = _loadedModelPath!.toLowerCase();
-    if (pathLower.contains("gemma")) return "Gemma 3 1B";
-    if (pathLower.contains("qwen2.5-1.5b") || pathLower.contains("qwen3")) return "Qwen3 1.7B";
-    if (pathLower.contains("llama")) return "Llama 3.2 1B";
-    if (pathLower.contains("smollm")) return "SmolLM2 1.7B";
-    if (pathLower.contains("qwen2.5-3b")) return "Qwen 2.5 3B";
-    if (pathLower.contains("phi")) return "Phi-3.5 Mini (3.8B)";
-    return "Local Offline Model";
+  LLMDiagnostics getDiagnostics() {
+    return LocalLLMHandler.getDiagnostics();
   }
 
-  String _getHuggingFaceModelId() {
-    if (_loadedModelPath == null) return "Qwen/Qwen2.5-1.5B-Instruct";
+  String _getModelFriendlyName() {
+    if (_loadedModelPath == null) return "Local AI";
     final pathLower = _loadedModelPath!.toLowerCase();
-    if (pathLower.contains("gemma")) return "google/gemma-3-1b-it";
-    if (pathLower.contains("qwen2.5-1.5b") || pathLower.contains("qwen3")) return "Qwen/Qwen2.5-1.5B-Instruct";
-    if (pathLower.contains("llama")) return "meta-llama/Llama-3.2-1B-Instruct";
-    if (pathLower.contains("smollm")) return "HuggingFaceTB/SmolLM2-1.7B-Instruct";
-    if (pathLower.contains("qwen2.5-3b")) return "Qwen/Qwen2.5-3B-Instruct";
-    if (pathLower.contains("phi")) return "microsoft/Phi-3.5-mini-instruct";
-    return "Qwen/Qwen2.5-1.5B-Instruct";
+    if (pathLower.contains("gemma-3") || pathLower.contains("gemma3")) return "Gemma 3 1B";
+    if (pathLower.contains("qwen2.5-1.5b")) return "Qwen 2.5 1.5B";
+    if (pathLower.contains("qwen2.5-3b")) return "Qwen 2.5 3B";
+    if (pathLower.contains("llama-3.2") || pathLower.contains("llama3")) return "Llama 3.2 1B";
+    if (pathLower.contains("smollm2")) return "SmolLM2 1.7B";
+    if (pathLower.contains("phi-3.5") || pathLower.contains("phi3")) return "Phi-3.5 Mini (3.8B)";
+    return "Offline Model";
   }
 }
